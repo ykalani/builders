@@ -4,13 +4,13 @@ From this repository root, run `make setup` once (Python venv, a C++20 compiler,
 
 `pipeline/engine.cpp` memory-maps event and click inputs and schedules LF-aligned chunks across `NCPU` workers. An event-ID bitmap scan identifies slots seen once. Unique recognized IDs bypass deduplication, while repeated slots and other ID formats use exact deduplication, preserving invalid earliest copies. The slot function reverses the seed-independent suffix of the public generator's ID permutation, with collisions safely routed through exact comparisons. Valid clicks go directly to person shards because identical click copies leave attribution and distinct campaign assists unchanged. Link ingestion assigns dense person numbers with union-find and preserves the byte-wise smallest name in each component. Short lowercase alphanumeric IDs use lossless numeric keys. Other IDs retain exact byte equality. Linked rows go straight to their assigned shard and local person index. Unlinked IDs receive an index within their owner shard. Both routing and grouping use 24-byte records. Each shard sorts each person's timeline and calls the shared session aggregator. Product categories are looked up only for purchases.
 
-Native workers write user Parquet parts directly from typed Arrow batches. C++ merges worker campaign totals and writes the campaign Parquet part. The submission starts a native executable that reads the manifest and uses the Rust CSV tokenizer. Its Arrow and Parquet libraries come from the pinned PyArrow wheel at build time. The local shared-library and standalone aggregation tools remain available for regression checks. Native timings include peak RSS.
+Native workers write user Parquet parts directly from typed Arrow batches. C++ merges worker campaign totals and writes the campaign Parquet part. The earlier hybrid starts a native executable that reads the manifest and uses the Rust CSV tokenizer. Its Arrow and Parquet libraries come from the pinned PyArrow wheel at build time. The local shared-library and standalone aggregation tools remain available for regression checks. Native timings include peak RSS.
 
 Attribution uses a rolling seven-day click queue, the latest winning click, and active click counts per campaign. Session starts snapshot the distinct assisting campaigns. Native stage times are logged to stderr. Run `.venv/bin/python scripts/check_attribution.py` after setup to compare rolling attribution with exhaustive click lookups.
 
 For local profiling, the native timing log reports wall time for ingestion, deduplication, user shards, and campaign output. Grouping, sorting, aggregation with Arrow appends, and Parquet writing inside user shards are reported as sums of per-shard elapsed times because shards run concurrently. Input is CSV.
 
-To enable the submission’s Rust CSV tokenizer in a local shared-library build, build a separate shared library with `.venv/bin/python scripts/build_native.py g++ /path/to/prototype/aggregate.so --rust-csv`. Put copies of `pipeline.py` and `native.py` beside it and run that entry point with the same input and worker count as the C++ build. The Rust build requires `rustc` on PATH.
+To enable the hybrid’s Rust CSV tokenizer in a local shared-library build, build a separate shared library with `.venv/bin/python scripts/build_native.py g++ /path/to/prototype/aggregate.so --rust-csv`. Put copies of `pipeline.py` and `native.py` beside it and run that entry point with the same input and worker count as the C++ build. The Rust build requires `rustc` on PATH.
 
 Run `make bench-parser BENCH_DATA=dev/benchmark-20m CPUS=8` to time the C++ tokenizer and shared row validation in isolation.
 
@@ -97,3 +97,13 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables.
 - `scripts/` runs your image the way the scorer does and diffs the output.
+
+## Rust submission
+
+The root Dockerfile builds the standalone Rust pipeline in `rewrites/rust`. It reads the same inputs and writes both Parquet tables using Apache Arrow's Rust writer. The previous hybrid is available at commit `18dfd1b2a67d`.
+
+```sh
+docker build -t shopping-sessions:latest .
+```
+
+The image uses `DATA_DIR`, `OUTPUT_DIR`, and `NCPU`. Use `scripts/docker_run.sh` to run it with local scorer settings.

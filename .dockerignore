@@ -14,3 +14,5 @@ starter-*/
 pipeline/preprocess
 pipeline/aggregate
 pipeline/aggregate.so
+
+rewrites/rust/target/

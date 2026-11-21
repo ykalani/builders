@@ -2,7 +2,6 @@
 #include "aggregate.hpp"
 #include "arrow_c_abi.h"
 #include <charconv>
-#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -10,7 +9,6 @@
 #include <cstdio>
 #include <iostream>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <unordered_map>
 
@@ -32,7 +30,6 @@ struct UserDaily {
     i64 sessions = 0, events = 0, revenue = 0;
     std::unordered_map<std::uint32_t, i64> categories;
 };
-struct CampaignDaily { i64 sessions = 0, purchasing = 0, revenue = 0, assists = 0; };
 struct Session {
     bool active = false;
     i64 first = 0, events = 0, revenue = 0;
@@ -52,11 +49,10 @@ Channels read_channels(const char* path) {
     return channels;
 }
 
-void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std::string>& names,
-                    std::uint32_t organic, const Channels& channels, const fs::path& temp) {
-    const auto began = std::chrono::steady_clock::now();
+CampaignTotals aggregate(const std::function<bool(Row&)>& next, const std::vector<std::string>& names,
+                         std::uint32_t organic, const UserSink& emit) {
     std::map<i64, UserDaily> users;
-    std::map<std::pair<std::uint32_t, i64>, CampaignDaily> campaigns;
+    CampaignTotals campaigns;
     std::deque<Click> clicks;
     std::unordered_map<std::uint32_t, size_t> active_campaigns;
     std::optional<LatestClick> latest;
@@ -65,7 +61,6 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     bool have_person = false, have_previous = false;
     i64 previous = 0;
     Session session;
-    std::chrono::steady_clock::duration attribution_time{};
 
     auto finish = [&] {
         if (!session.active) return;
@@ -83,10 +78,6 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
         session.active = false;
     };
 
-    std::ofstream user_out(temp / "user_daily.csv", std::ios::binary);
-    std::ofstream campaign_out(temp / "campaign_daily.csv", std::ios::binary);
-    if (!user_out || !campaign_out) throw std::runtime_error("Cannot open aggregate output");
-    user_out << "user_id,day,sessions,events,revenue_cents,top_category\n";
     auto flush_person = [&] {
         for (const auto& [key, user] : users) {
             const std::uint32_t* top = nullptr;
@@ -94,10 +85,7 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
             for (const auto& [category, revenue] : user.categories) {
                 if (!top || revenue > best || (revenue == best && names[category] < names[*top])) { top = &category; best = revenue; }
             }
-            field(user_out, person);
-            user_out << ',' << key << ',' << user.sessions << ',' << user.events << ',' << user.revenue << ',';
-            if (top) field(user_out, names[*top]);
-            user_out << '\n';
+            emit(person, key, user.sessions, user.events, user.revenue, top ? &names[*top] : nullptr);
         }
         users.clear();
     };
@@ -127,7 +115,6 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
         if (row.kind != 2) throw std::runtime_error("Invalid sorted row kind");
         if (!have_previous || ts - previous > 1800000) {
             finish();
-            const auto attribution_began = std::chrono::steady_clock::now();
             const i64 cutoff = ts - 604800000;
             while (!clicks.empty() && clicks.front().ts < cutoff) {
                 auto campaign = active_campaigns.find(clicks.front().campaign);
@@ -143,7 +130,6 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
             // Copy the campaign snapshot: clicks later in this session cannot assist it.
             session.assists.reserve(active_campaigns.size());
             for (const auto& campaign : active_campaigns) session.assists.push_back(campaign.first);
-            attribution_time += std::chrono::steady_clock::now() - attribution_began;
         }
         previous = ts;
         have_previous = true;
@@ -155,6 +141,22 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     finish();
     flush_person();
 
+    return campaigns;
+}
+
+void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std::string>& names,
+                    std::uint32_t organic, const Channels& channels, const fs::path& temp) {
+    std::ofstream user_out(temp / "user_daily.csv", std::ios::binary);
+    std::ofstream campaign_out(temp / "campaign_daily.csv", std::ios::binary);
+    if (!user_out || !campaign_out) throw std::runtime_error("Cannot open aggregate output");
+    user_out << "user_id,day,sessions,events,revenue_cents,top_category\n";
+    auto campaigns = aggregate(next, names, organic, [&](auto person, i64 day, i64 sessions,
+                                                         i64 events, i64 revenue, const std::string* top) {
+        field(user_out, person);
+        user_out << ',' << day << ',' << sessions << ',' << events << ',' << revenue << ',';
+        if (top) field(user_out, *top);
+        user_out << '\n';
+    });
     campaign_out << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
     for (const auto& [key, campaign] : campaigns) {
         field(campaign_out, names[key.first]); campaign_out << ',';
@@ -163,10 +165,6 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     }
     user_out.flush(); campaign_out.flush();
     if (!user_out || !campaign_out) throw std::runtime_error("Aggregate output write failed");
-    static std::mutex timing_mutex;
-    std::lock_guard<std::mutex> lock(timing_mutex);
-    std::cerr << "C++ attribution: " << std::chrono::duration<double>(attribution_time).count() << " seconds\n";
-    std::cerr << "C++ aggregation: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count() << " seconds\n";
 }
 
 class ArrowRows {

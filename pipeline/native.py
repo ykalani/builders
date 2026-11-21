@@ -1,4 +1,4 @@
-"""Transfer Arrow record batches to the native aggregator through the Arrow C ABI."""
+"""Bindings for the native pipeline and the Arrow aggregation regression tool."""
 import ctypes
 import os
 from pathlib import Path

@@ -1,5 +1,5 @@
 #include "input.hpp"
-#include "aggregate.hpp"
+#include "output.hpp"
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -9,6 +9,11 @@
 #include <cstring>
 #include <memory>
 #include <deque>
+
+#ifdef RUST_CSV
+struct RustField { size_t offset, len; };
+extern "C" bool rust_csv_fields(const char*, size_t, RustField*, size_t);
+#endif
 
 namespace {
 constexpr std::uint32_t CLICK = 1u << 31;
@@ -260,14 +265,27 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
     for (auto& producer : producers) producer.shards.resize(shard_count);
     parallel(chunks.size(), workers, [&](size_t task, size_t worker) {
         const auto& chunk = chunks[task];
+#ifdef RUST_CSV
+        std::string_view f[7];
+        RustField fields[7];
+        const size_t field_count = chunk.click ? 4 : 7;
+#else
         std::vector<std::string_view> f;
+#endif
         const char* begin = chunk.begin;
         while (begin < chunk.end) {
             const char* lf = static_cast<const char*>(std::memchr(begin, '\n', chunk.end - begin));
             const char* stop = lf ? lf : chunk.end;
             const std::string_view line(begin, stop - begin);
             begin = lf ? lf + 1 : stop;
+#ifdef RUST_CSV
+            if (!rust_csv_fields(line.data(), line.size(), fields, field_count)) continue;
+            for (size_t i = 0; i < field_count; ++i)
+                f[i] = line.substr(fields[i].offset, fields[i].len);
+            if (f[0].empty()) continue;
+#else
             if (!shopping::parse(line, f, chunk.click ? 4 : 7) || f[0].empty()) continue;
+#endif
             Parsed row;
             row.id = f[0];
             bool valid_ts = timestamp(f[chunk.click ? 3 : 2], row.ts);
@@ -353,7 +371,14 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
         std::cerr << "Routed rows: linked=" << linked << " unlinked_numeric=" << numeric
                   << " unlinked_fallback=" << fallback << '\n';
     }
+    fs::create_directories(output / "user_daily");
+    fs::create_directories(output / "campaign_daily");
+    using Clock = std::chrono::steady_clock;
+    struct ShardTiming { Clock::duration group{}, sort{}, aggregate{}, write{}; };
+    std::vector<ShardTiming> timings(shard_count);
+    std::vector<CampaignTotals> partials(shard_count);
     parallel(shard_count, workers, [&](size_t shard, size_t) {
+        const auto group_start = Clock::now();
         size_t count = 0;
         for (const auto& producer : producers) count += producer.shards[shard].size();
         const size_t nlinked = ids.person_count();
@@ -415,20 +440,62 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
             if (a.click && b.click) return click_ids[a.click - 1] < click_ids[b.click - 1];
             return false;
         };
+        const auto sort_start = Clock::now();
         for (size_t person = 0; person < persons.size(); ++person)
             std::sort(rows.begin() + offsets[person], rows.begin() + offsets[person + 1], earlier);
-        const auto work = output / ("worker-" + std::to_string(shard));
-        fs::create_directories(work);
+        const auto aggregate_start = Clock::now();
+        UserOutput users(output / "user_daily" / ("part-" + std::to_string(shard) + ".parquet"),
+                         {"user_id", "day", "sessions", "events", "revenue_cents", "top_category"});
         size_t cursor = 0;
-        aggregate_rows([&](Row& row) {
+        partials[shard] = aggregate([&](Row& row) {
             if (cursor == rows.size()) return false;
             const auto& input = rows[cursor++];
             row = {persons[input.person], input.click ? click_ids[input.click - 1] : std::string_view{},
                    input.ts, input.revenue, input.click ? 1 : 2, std::int32_t(input.code), input.person};
             return true;
-        }, names, 0, channels, work);
+        }, names, 0, [&](auto person, i64 day, i64 sessions, i64 events, i64 revenue, const std::string* top) {
+            users.add(person, static_cast<std::int32_t>(day), sessions, events, revenue, top);
+        });
+        users.close();
+        const auto write = users.write_time();
+        timings[shard] = {sort_start - group_start, aggregate_start - sort_start,
+                          Clock::now() - aggregate_start - write, write};
     });
+    const auto merge_start = Clock::now();
+    CampaignTotals totals;
+    for (const auto& partial : partials) {
+        for (const auto& [key, row] : partial) {
+            auto& total = totals[key];
+            total.sessions += row.sessions;
+            total.purchasing += row.purchasing;
+            total.revenue += row.revenue;
+            total.assists += row.assists;
+        }
+    }
+    const auto campaign_write_start = Clock::now();
+    CampaignOutput campaigns_out(output / "campaign_daily" / "part-0.parquet",
+        {"campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"});
+    for (const auto& [key, row] : totals) {
+        const auto& name = names[key.first];
+        campaigns_out.add(std::string_view(name), key.first == 0 ? std::string_view("organic") : channels.at(name),
+                          static_cast<std::int32_t>(key.second), row.sessions, row.purchasing, row.revenue, row.assists);
+    }
+    campaigns_out.close();
     const auto finished_at = std::chrono::steady_clock::now();
+    ShardTiming sum;
+    for (const auto& timing : timings) {
+        sum.group += timing.group;
+        sum.sort += timing.sort;
+        sum.aggregate += timing.aggregate;
+        sum.write += timing.write;
+    }
+    const auto seconds = [](auto elapsed) { return std::chrono::duration<double>(elapsed).count(); };
+    std::cerr << "User shards wall: " << seconds(merge_start - deduped_at) << " seconds\n"
+              << "User shard elapsed sums (seconds): grouping=" << seconds(sum.group)
+              << " sorting=" << seconds(sum.sort) << " aggregation and Arrow append=" << seconds(sum.aggregate)
+              << " Parquet writes=" << seconds(sum.write) << '\n'
+              << "Campaign merge wall: " << seconds(campaign_write_start - merge_start) << " seconds\n"
+              << "Campaign output wall: " << seconds(finished_at - campaign_write_start) << " seconds\n";
     std::cerr << "Native parallel sort and aggregation: " << std::chrono::duration<double>(finished_at - deduped_at).count() << " seconds\n";
     rusage usage{};
     getrusage(RUSAGE_SELF, &usage);

@@ -11,6 +11,7 @@ export IMAGE CPUS MEM PLATFORM
 .PHONY: build fixtures dev run-dev check-dev setup validate native
 
 CXX ?= g++
+PYTHON ?= python3
 native: pipeline/aggregate pipeline/aggregate.so
 
 pipeline/aggregate: pipeline/aggregate.cpp pipeline/csv.hpp pipeline/aggregate.hpp
@@ -18,12 +19,13 @@ pipeline/aggregate: pipeline/aggregate.cpp pipeline/csv.hpp pipeline/aggregate.h
 
 pipeline/aggregate: pipeline/arrow_c_abi.h
 
-pipeline/aggregate.so: pipeline/aggregate.cpp pipeline/engine.cpp pipeline/aggregate.hpp pipeline/input.hpp pipeline/csv.hpp pipeline/arrow_c_abi.h
-	$(CXX) -std=c++17 -O3 -pthread -Wall -Wextra -Werror -DAGGREGATE_LIBRARY -fPIC -shared pipeline/aggregate.cpp pipeline/engine.cpp -o $@
+pipeline/aggregate.so: pipeline/aggregate.cpp pipeline/engine.cpp pipeline/aggregate.hpp pipeline/input.hpp pipeline/csv.hpp pipeline/arrow_c_abi.h pipeline/output.hpp scripts/build_native.py
+	$(PYTHON) scripts/build_native.py $(CXX) $@
 
-setup: native
+setup:
 	python3 -m venv .venv
 	.venv/bin/pip install -r requirements-dev.txt
+	$(MAKE) native PYTHON=.venv/bin/python
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:

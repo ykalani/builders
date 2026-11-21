@@ -1,9 +1,12 @@
 # Compile the native stages at build time; no compiler is needed at run time.
 FROM python:3.12-slim-bookworm AS native
 RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
-COPY pipeline/engine.cpp pipeline/input.hpp pipeline/aggregate.cpp pipeline/aggregate.hpp pipeline/csv.hpp pipeline/arrow_c_abi.h /src/
-RUN g++ -std=c++17 -O3 -pthread -Wall -Wextra -Werror /src/aggregate.cpp -o /aggregate
-RUN g++ -std=c++17 -O3 -pthread -Wall -Wextra -Werror -DAGGREGATE_LIBRARY -fPIC -shared /src/aggregate.cpp /src/engine.cpp -o /aggregate.so
+COPY requirements.txt /build/requirements.txt
+RUN pip install --no-cache-dir -r /build/requirements.txt
+COPY pipeline/ /build/pipeline/
+COPY scripts/build_native.py /build/scripts/
+RUN g++ -std=c++17 -O3 -pthread -Wall -Wextra -Werror /build/pipeline/aggregate.cpp -o /aggregate
+RUN python /build/scripts/build_native.py g++ /aggregate.so
 
 # Shopping Sessions: native in-memory processing and Arrow Parquet output.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
@@ -20,7 +23,7 @@ COPY pipeline/ /app/pipeline/
 COPY --from=native /aggregate /app/pipeline/aggregate
 COPY --from=native /aggregate.so /app/pipeline/aggregate.so
 COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
+RUN sed -i 's/\r$//' /app/run.sh && chmod +x /app/run.sh
 
 # At run time the root filesystem is read-only, the user is 1000:1000, there is
 # no network, /data is read-only, and /output and /scratch are the only writable

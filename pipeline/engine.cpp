@@ -1,5 +1,8 @@
 #include "input.hpp"
 #include "output.hpp"
+#ifdef NATIVE_MAIN
+#include <nlohmann/json.hpp>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -247,13 +250,27 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
         }
     });
     std::vector<std::uint64_t> duplicates(words);
-    for (size_t word = 0; word < words; ++word) {
-        std::uint64_t present = 0;
+    constexpr size_t MERGE_WORDS = 4096;
+    const size_t merge_blocks = (words + MERGE_WORDS - 1) / MERGE_WORDS;
+    auto merge_bits = [&](size_t block, size_t) {
+        const size_t first = block * MERGE_WORDS;
+        const size_t last = std::min(first + MERGE_WORDS, words);
         for (int worker = 0; worker < workers; ++worker) {
-            duplicates[word] |= repeated[worker][word] | (present & seen[worker][word]);
-            present |= seen[worker][word];
+            // Collapse into worker zero's buffers because each task owns its word range.
+            if (worker == 0) {
+                std::copy(repeated[0].begin() + first, repeated[0].begin() + last,
+                          duplicates.begin() + first);
+                continue;
+            }
+            for (size_t word = first; word < last; ++word) {
+                const auto incoming = seen[worker][word];
+                duplicates[word] |= repeated[worker][word] | (seen[0][word] & incoming);
+                seen[0][word] |= incoming;
+            }
         }
-    }
+    };
+    if (merge_blocks == 1) merge_bits(0, 0);
+    else parallel(merge_blocks, workers, merge_bits);
     seen.clear();
     repeated.clear();
     const auto scanned_at = std::chrono::steady_clock::now();
@@ -434,11 +451,10 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
         for (const auto& row : rows) grouped[positions[row.person]++] = row;
         rows.swap(grouped);
         std::vector<CompactRow>().swap(grouped);
-        auto earlier = [&](const auto& a, const auto& b) {
+        auto earlier = [](const auto& a, const auto& b) {
             if (a.ts != b.ts) return a.ts < b.ts;
-            if (bool(a.click) != bool(b.click)) return bool(a.click);
-            if (a.click && b.click) return click_ids[a.click - 1] < click_ids[b.click - 1];
-            return false;
+            // Attribution resolves click ID ties after all clicks at this time are seen.
+            return bool(a.click) && !b.click;
         };
         const auto sort_start = Clock::now();
         for (size_t person = 0; person < persons.size(); ++person)
@@ -514,3 +530,28 @@ extern "C" int run_pipeline(const char* data, const char* output, i64 start, i64
         return 1;
     }
 }
+
+#ifdef NATIVE_MAIN
+int main() {
+    try {
+        const auto env = [](const char* key, const char* fallback) {
+            const auto* value = std::getenv(key);
+            return value ? value : fallback;
+        };
+        const fs::path data = env("DATA_DIR", "/data");
+        std::ifstream manifest_file(data / "manifest.json");
+        const auto manifest = nlohmann::json::parse(manifest_file);
+        i64 start = 0, end = 0;
+        if (!timestamp(manifest.at("window_start").get<std::string>(), start) ||
+            !timestamp(manifest.at("window_end").get<std::string>(), end))
+            throw std::runtime_error("Invalid manifest window");
+        const int workers = std::stoi(env("NCPU", "8"));
+        if (workers < 1) throw std::runtime_error("NCPU must be positive");
+        execute(data, env("OUTPUT_DIR", "/output"), start, end, workers);
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "pipeline: " << error.what() << '\n';
+        return 1;
+    }
+}
+#endif

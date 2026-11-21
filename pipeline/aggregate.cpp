@@ -28,14 +28,11 @@ struct Click { i64 ts; std::uint32_t campaign; };
 struct LatestClick { i64 ts; std::string id; std::uint32_t campaign; };
 struct UserDaily {
     i64 sessions = 0, events = 0, revenue = 0;
-    std::unordered_map<std::uint32_t, i64> categories;
 };
 struct Session {
     bool active = false;
-    i64 first = 0, events = 0, revenue = 0;
-    std::unordered_map<std::uint32_t, i64> categories;
-    std::uint32_t winner = 0;
-    std::vector<std::uint32_t> assists;
+    i64 events = 0, revenue = 0;
+    CampaignDaily* winner = nullptr;
 };
 
 i64 day_of(i64 ts) {
@@ -51,10 +48,16 @@ Channels read_channels(const char* path) {
 
 CampaignTotals aggregate(const std::function<bool(Row&)>& next, const std::vector<std::string>& names,
                          std::uint32_t organic, const UserSink& emit) {
-    std::map<i64, UserDaily> users;
+    UserDaily user;
+    i64 user_day = 0;
     CampaignTotals campaigns;
     std::deque<Click> clicks;
-    std::unordered_map<std::uint32_t, size_t> active_campaigns;
+    // Dense counts and a packed list let expiry and insertion avoid hash lookups.
+    std::vector<size_t> counts(names.size()), positions(names.size());
+    std::vector<std::uint32_t> active;
+    std::vector<i64> category_revenue(names.size());
+    std::vector<bool> category_seen(names.size());
+    std::vector<std::uint32_t> purchased_categories;
     std::optional<LatestClick> latest;
     std::string person;
     std::uint32_t person_number = UINT32_MAX;
@@ -64,30 +67,29 @@ CampaignTotals aggregate(const std::function<bool(Row&)>& next, const std::vecto
 
     auto finish = [&] {
         if (!session.active) return;
-        const i64 day = day_of(session.first);
-        auto& user = users[day];
-        ++user.sessions;
         user.events += session.events;
         user.revenue += session.revenue;
-        for (const auto& [category, amount] : session.categories) user.categories[category] += amount;
-        auto& campaign = campaigns[{session.winner, day}];
-        ++campaign.sessions;
-        campaign.purchasing += session.revenue > 0;
-        campaign.revenue += session.revenue;
-        for (const auto& campaign_id : session.assists) ++campaigns[{campaign_id, day}].assists;
+        session.winner->purchasing += session.revenue > 0;
+        session.winner->revenue += session.revenue;
         session.active = false;
     };
 
-    auto flush_person = [&] {
-        for (const auto& [key, user] : users) {
-            const std::uint32_t* top = nullptr;
-            i64 best = 0;
-            for (const auto& [category, revenue] : user.categories) {
-                if (!top || revenue > best || (revenue == best && names[category] < names[*top])) { top = &category; best = revenue; }
+    auto flush_day = [&] {
+        if (!user.sessions) return;
+        const std::string* top = nullptr;
+        i64 best = 0;
+        for (const auto category : purchased_categories) {
+            const auto revenue = category_revenue[category];
+            category_revenue[category] = 0;
+            category_seen[category] = false;
+            if (!top || revenue > best || (revenue == best && names[category] < *top)) {
+                top = &names[category];
+                best = revenue;
             }
-            emit(person, key, user.sessions, user.events, user.revenue, top ? &names[*top] : nullptr);
         }
-        users.clear();
+        emit(person, user_day, user.sessions, user.events, user.revenue, top);
+        user.sessions = user.events = user.revenue = 0;
+        purchased_categories.clear();
     };
 
     Row row;
@@ -96,18 +98,23 @@ CampaignTotals aggregate(const std::function<bool(Row&)>& next, const std::vecto
         const i64 ts = row.ts;
         if (!have_person || (row.person_number == UINT32_MAX ? row.person != person : row.person_number != person_number)) {
             finish();
-            flush_person();
+            flush_day();
             person = row.person;
             person_number = row.person_number;
             have_person = true;
             have_previous = false;
             clicks.clear();
-            active_campaigns.clear();
+            for (auto campaign : active) counts[campaign] = 0;
+            active.clear();
             latest.reset();
         }
         if (row.kind == 1) {
             clicks.push_back({ts, std::uint32_t(row.code)});
-            ++active_campaigns[clicks.back().campaign];
+            const auto campaign = clicks.back().campaign;
+            if (counts[campaign]++ == 0) {
+                positions[campaign] = active.size();
+                active.push_back(campaign);
+            }
             if (!latest || ts > latest->ts || (ts == latest->ts && row.id < std::string_view(latest->id)))
                 latest = LatestClick{ts, std::string(row.id), std::uint32_t(row.code)};
             continue;
@@ -117,29 +124,43 @@ CampaignTotals aggregate(const std::function<bool(Row&)>& next, const std::vecto
             finish();
             const i64 cutoff = ts - 604800000;
             while (!clicks.empty() && clicks.front().ts < cutoff) {
-                auto campaign = active_campaigns.find(clicks.front().campaign);
-                if (--campaign->second == 0) active_campaigns.erase(campaign);
+                const auto campaign = clicks.front().campaign;
+                if (--counts[campaign] == 0) {
+                    const auto last = active.back();
+                    positions[last] = positions[campaign];
+                    active[positions[campaign]] = last;
+                    active.pop_back();
+                }
                 clicks.pop_front();
             }
             // If the newest click expired, every older click has expired too.
             if (latest && latest->ts < cutoff) latest.reset();
             session = Session{};
             session.active = true;
-            session.first = ts;
-            session.winner = latest ? latest->campaign : organic;
-            // Copy the campaign snapshot: clicks later in this session cannot assist it.
-            session.assists.reserve(active_campaigns.size());
-            for (const auto& campaign : active_campaigns) session.assists.push_back(campaign.first);
+            const i64 day = day_of(ts);
+            if (day != user_day) flush_day();
+            user_day = day;
+            ++user.sessions;
+            session.winner = &campaigns[{latest ? latest->campaign : organic, day}];
+            ++session.winner->sessions;
+            // Attribute immediately so clicks later in this session cannot assist it.
+            for (auto campaign : active) ++campaigns[{campaign, day}].assists;
         }
         previous = ts;
         have_previous = true;
         const i64 revenue = row.revenue;
         ++session.events;
         session.revenue += revenue;
-        if (revenue) session.categories[std::uint32_t(row.code)] += revenue;
+        if (revenue) {
+            if (!category_seen[row.code]) {
+                category_seen[row.code] = true;
+                purchased_categories.push_back(std::uint32_t(row.code));
+            }
+            category_revenue[row.code] += revenue;
+        }
     }
     finish();
-    flush_person();
+    flush_day();
 
     return campaigns;
 }

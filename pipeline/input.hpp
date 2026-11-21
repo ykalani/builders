@@ -50,16 +50,19 @@ i64 days(int year, int month, int day) {
 
 bool timestamp(std::string_view s, i64& value) {
     if (s.empty()) return false;
-    if (std::all_of(s.begin(), s.end(), digit)) {
+    const bool iso = (s.size() == 20 || s.size() == 25) &&
+                     s[4] == '-' && s[7] == '-' && s[10] == 'T' && s[13] == ':' && s[16] == ':';
+    if (!iso) {
         value = 0;
+        // Up to 18 digits always fit in a signed 64-bit value.
+        const bool check_overflow = s.size() > 18;
         for (char c : s) {
-            if (value > (std::numeric_limits<i64>::max() - (c - '0')) / 10) return false;
+            if (!digit(c) || (check_overflow && value > (std::numeric_limits<i64>::max() - (c - '0')) / 10))
+                return false;
             value = value * 10 + c - '0';
         }
         return true;
     }
-    if (s.size() != 20 && s.size() != 25) return false;
-    if (s[4] != '-' || s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':') return false;
     int y = number(s, 0, 4), m = number(s, 5, 2), d = number(s, 8, 2);
     int h = number(s, 11, 2), minute = number(s, 14, 2), second = number(s, 17, 2);
     if (y < 1 || m < 1 || m > 12 || d < 1 || h < 0 || h > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return false;

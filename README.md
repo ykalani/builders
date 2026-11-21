@@ -12,6 +12,8 @@ For local profiling, the native timing log reports wall time for ingestion, dedu
 
 To enable the submission’s Rust CSV tokenizer in a local shared-library build, build a separate shared library with `.venv/bin/python scripts/build_native.py g++ /path/to/prototype/aggregate.so --rust-csv`. Put copies of `pipeline.py` and `native.py` beside it and run that entry point with the same input and worker count as the C++ build. The Rust build requires `rustc` on PATH.
 
+Run `make bench-parser BENCH_DATA=dev/benchmark-20m CPUS=8` to time the C++ tokenizer and shared row validation in isolation.
+
 For submission, push this repository to a public GitHub repository and provide its commit SHA to the platform. The platform builds the root Dockerfile and runs its default command. Keep generated data, output, and the virtual environment untracked; `.gitignore` excludes them. Run `make validate` successfully before submitting a solution.
 
 This repository contains a native C++ pipeline and the supplied fixture and dev-data checkers.

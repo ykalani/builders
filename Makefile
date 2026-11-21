@@ -19,7 +19,7 @@ pipeline/aggregate: pipeline/aggregate.cpp pipeline/csv.hpp pipeline/aggregate.h
 
 pipeline/aggregate: pipeline/arrow_c_abi.h
 
-pipeline/aggregate.so: pipeline/aggregate.cpp pipeline/engine.cpp pipeline/aggregate.hpp pipeline/input.hpp pipeline/csv.hpp pipeline/arrow_c_abi.h pipeline/output.hpp scripts/build_native.py
+pipeline/aggregate.so: pipeline/aggregate.cpp pipeline/engine.cpp pipeline/aggregate.hpp pipeline/input.hpp pipeline/decode.hpp pipeline/chunks.hpp pipeline/csv.hpp pipeline/arrow_c_abi.h pipeline/output.hpp scripts/build_native.py
 	$(PYTHON) scripts/build_native.py $(CXX) $@
 
 setup:
@@ -49,3 +49,12 @@ check-dev:
 	.venv/bin/python scripts/compare.py out $(ANSWER)
 
 validate: fixtures dev run-dev check-dev
+
+.PHONY: bench-parser
+BENCH_DATA ?= dev/benchmark-20m
+bench-parser: out/tools/bench_parser
+	python3 scripts/bench_parser.py $< "$(BENCH_DATA)" "$(CPUS)"
+
+out/tools/bench_parser: scripts/bench_parser.cpp pipeline/decode.hpp pipeline/input.hpp pipeline/chunks.hpp pipeline/csv.hpp
+	mkdir -p $(@D)
+	$(CXX) -std=c++17 -O3 -pthread -Wall -Wextra -Werror $< -o $@
